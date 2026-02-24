@@ -1,5 +1,5 @@
 import heapq
-import mmap
+import json
 import os
 from functools import reduce
 import regex as re
@@ -210,10 +210,48 @@ class FastBPETrainer:
             # Make sure all boundaries are unique, but might be fewer than num_chunks
             return sorted(set(chunk_boundaries))
 
-    def _process_chunk(self, path: str, start: int, end: int) -> Counter:
+    def _process_chunk(
+        self, path: str, start: int, end: int, batch_size: int = 10_000_000
+    ) -> Counter:
+        """
+        Process a file chunk using buffered reading instead of mmap.
+
+        Args:
+            path: Path to the input file
+            start: Start byte position
+            end: End byte position
+            batch_size: Number of bytes to read per batch (default 10MB)
+        """
+        freqs = Counter()
+
         with open(path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                return self._count_words(mm[start:end])
+            f.seek(start)
+            remaining = end - start
+
+            while remaining > 0:
+                # Read in batches to control memory usage
+                to_read = min(batch_size, remaining)
+                data = f.read(to_read)
+                if not data:
+                    break
+
+                # If this isn't the last chunk, ensure we don't split a UTF-8 character
+                if len(data) == to_read and remaining > to_read:
+                    # UTF-8 continuation bytes have pattern 10xxxxxx (0x80-0xBF)
+                    trim_pos = len(data)
+                    while trim_pos > 0 and data[trim_pos - 1] & 0xC0 == 0x80:
+                        trim_pos -= 1
+                    if trim_pos < len(data):
+                        # Put back the incomplete character bytes
+                        f.seek(f.tell() - (len(data) - trim_pos))
+                        data = data[:trim_pos]
+
+                # Process this batch
+                batch_freqs = self._count_words(data)
+                freqs.update(batch_freqs)
+                remaining -= len(data)
+
+        return freqs
             
     def _count_words(self, data: bytes) -> Counter:
         text = data.decode('utf-8', errors='ignore')
@@ -228,4 +266,19 @@ class FastBPETrainer:
                 word = tuple(bytes([b]) for b in m.group().encode('utf-8'))
                 freqs[word] += 1
         return freqs
+
+    def save_vocab_json(self, output_path: str) -> None:
+        """Save vocab to JSON file with token IDs as keys and token strings as values."""
+        serializable_vocab = {}
+        for token_id, token_bytes in self.vocab.items():
+            # Use latin-1 to get a 1:1 byte-to-char mapping, then escape non-printable
+            token_str = token_bytes.decode('utf-8', errors='backslashreplace')
+            serializable_vocab[str(token_id)] = token_str
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_vocab, f, ensure_ascii=False, indent=2)
+
+    def save_merges_txt(self, output_path: str) -> None:
+        with open(output_path, "w") as f:
+            for a, b in self.merges:
+                f.write(f"{a.decode('utf-8', errors='ignore')} {b.decode('utf-8', errors='ignore')}\n")
 
